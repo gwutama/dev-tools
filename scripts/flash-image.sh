@@ -13,6 +13,7 @@ TEMP_DIR=""
 SUDO_PASSWORD=""
 FLASH_RESULT=0
 FLASH_DETAILS=""
+VERIFY_RESULT=0
 SELECTED_DISK_INDEX=0
 SELECTED_IMAGE_INDEX=0
 
@@ -63,7 +64,7 @@ done
 # and whether the script is running as root.
 check_dependencies() {
     local missing=()
-    local commands=(dialog pv dd find wc awk sed sync uname basename dirname mktemp mkfifo rm id)
+    local commands=(dialog pv dd head find wc awk sed sync uname basename dirname mktemp mkfifo rm id)
 
     case "$OS" in
         Linux)
@@ -88,6 +89,11 @@ check_dependencies() {
             missing+=("$command_name")
         fi
     done
+
+    # Require either sha256sum (Linux/GNU coreutils) or shasum (macOS/Perl).
+    if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+        missing+=(sha256sum)
+    fi
 
     if ((${#missing[@]} > 0)); then
         printf 'Error: missing required tools:' >&2
@@ -134,6 +140,16 @@ show_error() {
 show_info() {
     dialog --clear --backtitle "$BACKTITLE" --title "Information" \
         --msgbox "$1" 9 70
+}
+
+# Compute the SHA-256 digest of stdin and print only the lowercase hex hash.
+# Supports sha256sum (Linux/GNU) and shasum (macOS).
+sha256_stream() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    else
+        shasum -a 256 | awk '{print $1}'
+    fi
 }
 
 # Convert a byte count to a human-readable size string (e.g. 1.4 GiB).
@@ -428,18 +444,77 @@ flash_image() {
     FLASH_RESULT=0
 }
 
+# Reads back exactly as many bytes as the source image from the target device,
+# computes SHA-256 on both streams in parallel, and compares the digests.
+# Displays a progress gauge while reading from the device.
+# Sets VERIFY_RESULT to 0 (hashes match) or 1 (mismatch or read error).
+verify_flash() {
+    local image_size output_device verify_fifo img_hash_file img_hash dev_hash
+    image_size=$(wc -c < "$SELECTED_IMAGE" | awk '{print $1}')
+    output_device=$(raw_output_device)
+    verify_fifo="$TEMP_DIR/verify.fifo"
+    img_hash_file="$TEMP_DIR/img-hash"
+
+    mkfifo "$verify_fifo"
+
+    dialog --clear --backtitle "$BACKTITLE" \
+        --title "Step 4 of 4 \u2014 Verifying" \
+        --gauge "Verifying $(basename "$SELECTED_IMAGE") against $SELECTED_DISK\n\nDo not remove the disk or power off the computer." \
+        12 78 0 < "$verify_fifo" &
+    local dialog_pid=$!
+
+    # Keep the gauge FIFO open for the duration of the read-back.
+    exec 3>"$verify_fifo"
+
+    # Hash the source image in the background while reading back from the device.
+    sha256_stream < "$SELECTED_IMAGE" > "$img_hash_file" &
+    local img_hash_pid=$!
+
+    set +e
+    dev_hash=$(run_as_root dd if="$output_device" bs=4194304 2>/dev/null \
+        | head -c "$image_size" \
+        | pv -n -s "$image_size" 2> >(
+            while IFS= read -r percent; do
+                percent=${percent%.*}
+                [[ "$percent" =~ ^[0-9]+$ ]] || continue
+                ((percent > 99)) && percent=99
+                printf '%s\n' "$percent" >&3
+            done
+        ) \
+        | sha256_stream)
+    local verify_status=$?
+    set -e
+
+    wait "$img_hash_pid" 2>/dev/null || true
+    img_hash=$(cat "$img_hash_file" 2>/dev/null || true)
+
+    printf '100\n' >&3
+    exec 3>&-
+    wait "$dialog_pid" 2>/dev/null || true
+    rm -f -- "$verify_fifo"
+
+    if ((verify_status != 0)) || [[ -z "$img_hash" || -z "$dev_hash" || "$img_hash" != "$dev_hash" ]]; then
+        VERIFY_RESULT=1
+    else
+        VERIFY_RESULT=0
+    fi
+}
+
 # Step 4: Show the outcome of the flash operation.
 # Displays a success or failure message and offers the user two choices:
 #   Restart (return 0) — go back to step 1 to flash another image.
 #   Exit    (return 1) — quit the program.
 show_flash_result() {
     local title body
-    if ((FLASH_RESULT == 0)); then
-        title="Step 4 of 4 — Success"
-        body="Flashing completed successfully.\n\nImage:\n$SELECTED_IMAGE_LABEL\n\nTarget:\n$SELECTED_DISK_LABEL\n\nThe operating system may now detect new partitions on the target disk."
-    else
-        title="Step 4 of 4 — Failed"
+    if ((FLASH_RESULT != 0)); then
+        title="Step 4 of 4 \u2014 Failed"
         body="Flashing failed.\n\n$FLASH_DETAILS"
+    elif ((VERIFY_RESULT != 0)); then
+        title="Step 4 of 4 \u2014 Verification failed"
+        body="The image was written but verification failed.\nThe data on disk does not match the source image.\n\nImage:\n$SELECTED_IMAGE_LABEL\n\nTarget:\n$SELECTED_DISK_LABEL"
+    else
+        title="Step 4 of 4 \u2014 Success"
+        body="Flashing completed and verified successfully.\n\nImage:\n$SELECTED_IMAGE_LABEL\n\nTarget:\n$SELECTED_DISK_LABEL\n\nThe operating system may now detect new partitions on the target disk."
     fi
 
     dialog --clear --backtitle "$BACKTITLE" \
@@ -475,6 +550,7 @@ main() {
                 esac
                 ;;
             4)
+                ((FLASH_RESULT == 0)) && verify_flash
                 show_flash_result
                 case $? in
                     0) step=1 ;;
