@@ -210,79 +210,133 @@ list_disks_macos() {
 
 # Step 1: Present a radiolist of physical disks and let the user choose one.
 # Sets SELECTED_DISK and SELECTED_DISK_LABEL on success.
-# Returns 1 if no disks are found or the user cancels (exits the program).
+# The "Refresh" button re-scans for disks without leaving the dialog.
+# Returns 1 if the user cancels (exits the program).
 select_disk() {
-    case "$OS" in
-        Linux) list_disks_linux ;;
-        Darwin) list_disks_macos ;;
-    esac
+    local rescan=1
+    while true; do
+        # Re-scan on first entry and after every Refresh press.
+        if ((rescan)); then
+            case "$OS" in
+                Linux) list_disks_linux ;;
+                Darwin) list_disks_macos ;;
+            esac
+            rescan=0
+        fi
 
-    if ((${#DISK_DEVICES[@]} == 0)); then
-        show_error "No physical disks were detected."
-        return 1
-    fi
+        if ((${#DISK_DEVICES[@]} == 0)); then
+            if ! dialog --clear --backtitle "$BACKTITLE" \
+                --title "No disks detected" \
+                --yes-label "Refresh" --no-label "Exit" \
+                --yesno "No physical disks were detected.\n\nPlug in a disk and press Refresh to scan again." \
+                10 70; then
+                return 1
+            fi
+            rescan=1
+            continue
+        fi
 
-    local menu_items=()
-    local i state
-    # Clamp the remembered index in case the disk list changed between visits.
-    ((SELECTED_DISK_INDEX >= ${#DISK_DEVICES[@]})) && SELECTED_DISK_INDEX=0
-    for ((i = 0; i < ${#DISK_DEVICES[@]}; i++)); do
-        state="off"
-        ((i == SELECTED_DISK_INDEX)) && state="on"
-        menu_items+=("$i" "${DISK_LABELS[$i]}" "$state")
+        local menu_items=()
+        local i state
+        # Clamp the remembered index in case the disk list changed between scans.
+        ((SELECTED_DISK_INDEX >= ${#DISK_DEVICES[@]})) && SELECTED_DISK_INDEX=0
+        for ((i = 0; i < ${#DISK_DEVICES[@]}; i++)); do
+            state="off"
+            ((i == SELECTED_DISK_INDEX)) && state="on"
+            menu_items+=("$i" "${DISK_LABELS[$i]}" "$state")
+        done
+
+        local selected dialog_exit
+        selected=$(dialog --clear --backtitle "$BACKTITLE" \
+            --title "Step 1 of 4 — Select target disk" \
+            --extra-button --extra-label "Refresh" \
+            --radiolist "Select the disk to overwrite. All data on it will be destroyed." \
+            20 90 12 "${menu_items[@]}" 3>&1 1>&2 2>&3)
+        dialog_exit=$?
+
+        case $dialog_exit in
+            0)  # OK — disk chosen
+                SELECTED_DISK_INDEX=$selected
+                SELECTED_DISK=${DISK_DEVICES[$selected]}
+                SELECTED_DISK_LABEL=${DISK_LABELS[$selected]}
+                return 0
+                ;;
+            3)  # Refresh — re-scan and redraw
+                rescan=1
+                ;;
+            *)  # Cancel or ESC — exit
+                return 1
+                ;;
+        esac
     done
-
-    local selected
-    selected=$(dialog --clear --backtitle "$BACKTITLE" \
-        --title "Step 1 of 4 — Select target disk" \
-        --radiolist "Select the disk to overwrite. All data on it will be destroyed." \
-        20 90 12 "${menu_items[@]}" 3>&1 1>&2 2>&3) || return 1
-
-    SELECTED_DISK_INDEX=$selected
-    SELECTED_DISK=${DISK_DEVICES[$selected]}
-    SELECTED_DISK_LABEL=${DISK_LABELS[$selected]}
 }
 
 # Step 2: Scan IMAGES_DIR for regular files and let the user pick one.
 # Sets SELECTED_IMAGE and SELECTED_IMAGE_LABEL on success.
-# Returns 1 on error, 2 if the user pressed Back (return to step 1).
+# The "Refresh" button re-scans the directory without leaving the dialog.
+# Returns 2 if the user pressed Back (return to step 1).
 select_image() {
-    IMAGE_PATHS=()
-    IMAGE_LABELS=()
+    local rescan=1
+    local path size bytes menu_items i state selected dialog_exit
+    while true; do
+        # Re-scan on first entry and after every Refresh press.
+        if ((rescan)); then
+            IMAGE_PATHS=()
+            IMAGE_LABELS=()
+            while IFS= read -r -d '' path; do
+                bytes=$(wc -c < "$path" | awk '{print $1}')
+                size=$(format_file_size "$bytes")
+                IMAGE_PATHS+=("$path")
+                IMAGE_LABELS+=("$(basename "$path") — $size")
+            done < <(find "$IMAGES_DIR" -maxdepth 1 -type f -print0 2>/dev/null | sort -z)
+            rescan=0
+        fi
 
-    local path size bytes
-    while IFS= read -r -d '' path; do
-        bytes=$(wc -c < "$path" | awk '{print $1}')
-        size=$(format_file_size "$bytes")
-        IMAGE_PATHS+=("$path")
-        IMAGE_LABELS+=("$(basename "$path") — $size")
-    done < <(find "$IMAGES_DIR" -maxdepth 1 -type f -print0 2>/dev/null | sort -z)
+        if ((${#IMAGE_PATHS[@]} == 0)); then
+            dialog --clear --backtitle "$BACKTITLE" \
+                --title "No images found" \
+                --yes-label "Refresh" --no-label "Back" \
+                --yesno "No image files were found in:\n\n$IMAGES_DIR\n\nAdd images to the directory and press Refresh to scan again." \
+                12 70
+            case $? in
+                0) rescan=1 ;;  # Refresh
+                *) return 2 ;;  # Back
+            esac
+            continue
+        fi
 
-    if ((${#IMAGE_PATHS[@]} == 0)); then
-        show_error "No image files were found in:\n\n$IMAGES_DIR"
-        return 1
-    fi
+        menu_items=()
+        # Clamp the remembered index in case the image list changed between scans.
+        ((SELECTED_IMAGE_INDEX >= ${#IMAGE_PATHS[@]})) && SELECTED_IMAGE_INDEX=0
+        for ((i = 0; i < ${#IMAGE_PATHS[@]}; i++)); do
+            state="off"
+            ((i == SELECTED_IMAGE_INDEX)) && state="on"
+            menu_items+=("$i" "${IMAGE_LABELS[$i]}" "$state")
+        done
 
-    local menu_items=()
-    local i state
-    # Clamp the remembered index in case the image list changed between visits.
-    ((SELECTED_IMAGE_INDEX >= ${#IMAGE_PATHS[@]})) && SELECTED_IMAGE_INDEX=0
-    for ((i = 0; i < ${#IMAGE_PATHS[@]}; i++)); do
-        state="off"
-        ((i == SELECTED_IMAGE_INDEX)) && state="on"
-        menu_items+=("$i" "${IMAGE_LABELS[$i]}" "$state")
+        selected=$(dialog --clear --backtitle "$BACKTITLE" \
+            --title "Step 2 of 4 — Select image" \
+            --cancel-label "Back" \
+            --extra-button --extra-label "Refresh" \
+            --radiolist "Select a raw disk image from:\n$IMAGES_DIR" \
+            20 90 12 "${menu_items[@]}" 3>&1 1>&2 2>&3)
+        dialog_exit=$?
+
+        case $dialog_exit in
+            0)  # OK — image chosen
+                SELECTED_IMAGE_INDEX=$selected
+                SELECTED_IMAGE=${IMAGE_PATHS[$selected]}
+                SELECTED_IMAGE_LABEL=${IMAGE_LABELS[$selected]}
+                return 0
+                ;;
+            3)  # Refresh — re-scan and redraw
+                rescan=1
+                ;;
+            *)  # Back or ESC
+                return 2
+                ;;
+        esac
     done
-
-    local selected
-    selected=$(dialog --clear --backtitle "$BACKTITLE" \
-        --title "Step 2 of 4 — Select image" \
-        --cancel-label "Back" \
-        --radiolist "Select a raw disk image from:\n$IMAGES_DIR" \
-        20 90 12 "${menu_items[@]}" 3>&1 1>&2 2>&3) || return 2
-
-    SELECTED_IMAGE_INDEX=$selected
-    SELECTED_IMAGE=${IMAGE_PATHS[$selected]}
-    SELECTED_IMAGE_LABEL=${IMAGE_LABELS[$selected]}
 }
 
 # Ensure the script has root privileges needed to write to a raw device.
@@ -538,8 +592,7 @@ main() {
                 select_image
                 case $? in
                     0) step=3 ;;
-                    2) step=1 ;;
-                    *) exit 0 ;;
+                    *) step=1 ;;
                 esac
                 ;;
             3)
