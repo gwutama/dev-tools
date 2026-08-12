@@ -7,8 +7,11 @@ WARNING: The selected target disk is completely overwritten.
 
 import argparse
 import atexit
+import bz2
 import curses
+import gzip
 import hashlib
+import lzma
 import os
 import platform
 import shutil
@@ -18,6 +21,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+import zipfile
 from pathlib import Path
 
 PROGRAM_NAME = 'Image Flasher'
@@ -83,6 +87,54 @@ def raw_device(disk):
     On macOS /dev/diskN → /dev/rdiskN; Linux is unchanged.
     """
     return disk.replace('/dev/disk', '/dev/rdisk', 1) if OS == 'Darwin' else disk
+
+
+COMPRESSION_OPENERS = {
+    '.gz': gzip.open,
+    '.bz2': bz2.open,
+    '.xz': lzma.open,
+}
+UNSUPPORTED_COMPRESSION_SUFFIXES = {
+    '.7z', '.rar', '.tar', '.tbz', '.tgz', '.txz', '.z', '.zst',
+}
+
+
+def unpack_image(image):
+    """Return (image_path, error). Extract supported compressed images to temp."""
+    source = Path(image)
+    suffix = source.suffix.lower()
+    if len(source.suffixes) > 1 and source.suffixes[-2].lower() == '.tar':
+        return None, 'TAR archives are not supported; select compressed raw image instead.'
+    if suffix not in COMPRESSION_OPENERS and suffix != '.zip':
+        if suffix in UNSUPPORTED_COMPRESSION_SUFFIXES:
+            return None, f'Compression format {suffix} is not supported.'
+        return image, ''
+
+    output = Path(_temp_dir) / source.stem
+    try:
+        if suffix == '.zip':
+            with zipfile.ZipFile(source) as archive:
+                members = [member for member in archive.infolist() if not member.is_dir()]
+                if len(members) != 1:
+                    return None, 'ZIP image must contain exactly one file.'
+                output = Path(_temp_dir) / Path(members[0].filename).name
+                with archive.open(members[0]) as src, output.open('wb') as dst:
+                    shutil.copyfileobj(src, dst)
+        else:
+            with COMPRESSION_OPENERS[suffix](source, 'rb') as src, output.open('wb') as dst:
+                shutil.copyfileobj(src, dst)
+    except (OSError, EOFError, lzma.LZMAError, zipfile.BadZipFile) as exc:
+        output.unlink(missing_ok=True)
+        return None, f'Could not unpack {source.name}: {exc}'
+
+    return str(output), ''
+
+
+def remove_unpacked_image(state):
+    """Delete temporary unpacked image, leaving original selected image intact."""
+    unpacked = state.pop('unpacked_image', '')
+    if unpacked:
+        Path(unpacked).unlink(missing_ok=True)
 
 
 # ── Curses TUI ────────────────────────────────────────────────────────────────
@@ -624,7 +676,6 @@ def flash_image(state):
     """Step 3: confirm and write the image to disk.
     Returns 0 (success), 1 (error), or 2 (back).
     """
-    image = state['selected_image']
     disk = state['selected_disk']
     out_dev = raw_device(disk)
 
@@ -638,12 +689,21 @@ def flash_image(state):
     if code != OK:
         return 2
 
+    image, err = unpack_image(state['selected_image'])
+    if err:
+        show_error(err)
+        return 2
+    if image != state['selected_image']:
+        state['unpacked_image'] = image
+
     if not obtain_sudo():
+        remove_unpacked_image(state)
         return 2
 
     ok, err = unmount_target(disk)
     if not ok:
         show_error(err)
+        remove_unpacked_image(state)
         state['flash_result'] = 1
         return 1
 
@@ -714,6 +774,7 @@ def flash_image(state):
     gauge.close()
 
     if not write_ok:
+        remove_unpacked_image(state)
         state['flash_details'] = err_details or \
             'The image could not be written to the selected disk.'
         state['flash_result'] = 1
@@ -728,7 +789,7 @@ def verify_flash(state):
     bytes read back from the device. Sets state['verify_result'] to 0 or 1.
     Uses Python's hashlib — no external sha256sum needed.
     """
-    image = state['selected_image']
+    image = state.get('unpacked_image', state['selected_image'])
     disk = state['selected_disk']
     out_dev = raw_device(disk)
     image_size = Path(image).stat().st_size
@@ -800,11 +861,13 @@ def verify_flash(state):
             read_ok = False
         reader_proc.stdout.close()   # closing pipe sends SIGPIPE to reader
         reader_proc.wait()
-    src_thread.join(timeout=60)
-    gauge.close()
-
-    match = read_ok and img_hash[0] is not None and h.hexdigest() == img_hash[0]
-    state['verify_result'] = 0 if match else 1
+    try:
+        src_thread.join(timeout=60)
+        match = read_ok and img_hash[0] is not None and h.hexdigest() == img_hash[0]
+        state['verify_result'] = 0 if match else 1
+    finally:
+        gauge.close()
+        remove_unpacked_image(state)
 
 
 def show_result(state):
