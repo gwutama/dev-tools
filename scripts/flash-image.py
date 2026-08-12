@@ -823,6 +823,12 @@ def verify_flash(state):
     bytes read back from the device. Sets state['verify_result'] to 0 or 1.
     Uses Python's hashlib — no external sha256sum needed.
     """
+    if not obtain_sudo():
+        state['verify_result'] = 1
+        state['verify_details'] = \
+            'Administrator permission is required to read the selected disk.'
+        return
+
     image = state.get('unpacked_image', state['selected_image'])
     disk = state['selected_disk']
     out_dev = raw_device(disk)
@@ -877,15 +883,18 @@ def verify_flash(state):
         reader_script = (
             'import sys\n'
             'f=open(sys.argv[1],"rb")\n'
-            'while True:\n'
-            ' c=f.read(4194304)\n'
+            'remaining=int(sys.argv[2])\n'
+            'while remaining:\n'
+            ' c=f.read(min(4194304, remaining))\n'
             ' if not c:break\n'
             ' sys.stdout.buffer.write(c)\n'
             ' sys.stdout.buffer.flush()\n'
+            ' remaining-=len(c)\n'
+            'f.close()\n'
         )
         reader_proc = subprocess.Popen(
-            ['sudo', '-n', 'python3', '-c', reader_script, out_dev],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            ['sudo', '-n', 'python3', '-c', reader_script, out_dev, str(image_size)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         try:
             while remaining > 0:
@@ -900,7 +909,14 @@ def verify_flash(state):
             read_ok = False
             state['verify_details'] = str(exc)
         reader_proc.stdout.close()   # closing pipe sends SIGPIPE to reader
+        stderr = reader_proc.stderr.read().decode(errors='replace').strip()
         reader_proc.wait()
+        if reader_proc.returncode:
+            read_ok = False
+            state['verify_details'] = (
+                f'sudo reader failed (exit {reader_proc.returncode}): '
+                f'{stderr or "no error output"}'
+            )
     try:
         src_thread.join()
         if hash_error[0]:
