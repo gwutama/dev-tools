@@ -112,6 +112,10 @@ def unpack_image(image):
         return image, ''
 
     output = Path(_temp_dir) / source.stem
+    gauge = Gauge(
+        'Unpacking image',
+        f'Unpacking {source.name}\n\nDo not remove the source image.',
+    )
     try:
         if suffix == '.zip':
             with zipfile.ZipFile(source) as archive:
@@ -120,13 +124,24 @@ def unpack_image(image):
                     return None, 'ZIP image must contain exactly one file.'
                 output = Path(_temp_dir) / Path(members[0].filename).name
                 with archive.open(members[0]) as src, output.open('wb') as dst:
-                    shutil.copyfileobj(src, dst)
+                    copied = 0
+                    for chunk in iter(lambda: src.read(4 * 1024 * 1024), b''):
+                        dst.write(chunk)
+                        copied += len(chunk)
+                        gauge.update(min(copied * 100 // members[0].file_size, 99))
         else:
-            with COMPRESSION_OPENERS[suffix](source, 'rb') as src, output.open('wb') as dst:
-                shutil.copyfileobj(src, dst)
+            with source.open('rb') as raw, \
+                    COMPRESSION_OPENERS[suffix](raw, 'rb') as src, \
+                    output.open('wb') as dst:
+                source_size = source.stat().st_size
+                for chunk in iter(lambda: src.read(4 * 1024 * 1024), b''):
+                    dst.write(chunk)
+                    gauge.update(min(raw.tell() * 100 // source_size, 99))
     except (OSError, EOFError, lzma.LZMAError, zipfile.BadZipFile) as exc:
         output.unlink(missing_ok=True)
         return None, f'Could not unpack {source.name}: {exc}'
+    finally:
+        gauge.close()
 
     return str(output), ''
 
