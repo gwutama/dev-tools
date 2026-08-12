@@ -21,6 +21,7 @@ import sys
 import tempfile
 import textwrap
 import threading
+from datetime import datetime
 import zipfile
 from pathlib import Path
 
@@ -135,6 +136,24 @@ def remove_unpacked_image(state):
     unpacked = state.pop('unpacked_image', '')
     if unpacked:
         Path(unpacked).unlink(missing_ok=True)
+
+
+def write_verification_log(image, device, image_size, bytes_read,
+                           source_hash, device_hash, details):
+    """Write persistent diagnostics for a failed verification."""
+    log = Path(tempfile.gettempdir()) / \
+        f'image-flasher-verify-{datetime.now():%Y%m%d-%H%M%S}.log'
+    log.write_text(
+        f'Verification failed: {datetime.now().isoformat()}\n'
+        f'Source image: {image}\n'
+        f'Device: {device}\n'
+        f'Image size: {image_size} bytes\n'
+        f'Bytes read: {bytes_read}\n'
+        f'Source SHA-256: {source_hash or "unavailable"}\n'
+        f'Device SHA-256: {device_hash}\n'
+        f'Details: {details}\n',
+    )
+    return str(log)
 
 
 # ── Curses TUI ────────────────────────────────────────────────────────────────
@@ -881,6 +900,11 @@ def verify_flash(state):
             state['verify_details'] = ''
         match = read_ok and not hash_error[0] and h.hexdigest() == img_hash[0]
         state['verify_result'] = 0 if match else 1
+        if not match:
+            state['verify_log'] = write_verification_log(
+                image, out_dev, image_size, image_size - remaining,
+                img_hash[0], h.hexdigest(), state['verify_details'],
+            )
     finally:
         gauge.close()
         remove_unpacked_image(state)
@@ -901,6 +925,7 @@ def show_result(state):
             'The image was written but verification failed.\n'
             'The data on disk does not match the source image.\n\n'
             f'{state.get("verify_details", "")}\n\n'
+            f'Diagnostic log:\n{state.get("verify_log", "unavailable")}\n\n'
             f'Image:\n{img}\n\nTarget:\n{disk}'
         )
     else:
@@ -949,7 +974,7 @@ def main():
         'selected_image': '', 'selected_image_label': '',
         # results
         'flash_result': 0, 'flash_details': '',
-        'verify_result': 0, 'verify_details': '',
+        'verify_result': 0, 'verify_details': '', 'verify_log': '',
     }
 
     step = 1
