@@ -802,13 +802,17 @@ def verify_flash(state):
 
     # Hash the source image in a background thread while reading the device.
     img_hash = [None]
+    hash_error = [None]
 
     def _hash_source():
-        h = hashlib.sha256()
-        with open(image, 'rb') as f:
-            for chunk in iter(lambda: f.read(4 * 1024 * 1024), b''):
-                h.update(chunk)
-        img_hash[0] = h.hexdigest()
+        try:
+            h = hashlib.sha256()
+            with open(image, 'rb') as f:
+                for chunk in iter(lambda: f.read(4 * 1024 * 1024), b''):
+                    h.update(chunk)
+            img_hash[0] = h.hexdigest()
+        except OSError as exc:
+            hash_error[0] = str(exc)
 
     src_thread = threading.Thread(target=_hash_source, daemon=True)
     src_thread.start()
@@ -831,8 +835,9 @@ def verify_flash(state):
                     h.update(chunk)
                     remaining -= len(chunk)
                     gauge.update(min((image_size - remaining) * 100 // image_size, 99))
-        except OSError:
+        except OSError as exc:
             read_ok = False
+            state['verify_details'] = str(exc)
     else:
         # Non-root: stream device via sudo python3.
         reader_script = (
@@ -857,13 +862,24 @@ def verify_flash(state):
                 h.update(chunk)
                 remaining -= len(chunk)
                 gauge.update(min((image_size - remaining) * 100 // image_size, 99))
-        except Exception:
+        except (OSError, BrokenPipeError) as exc:
             read_ok = False
+            state['verify_details'] = str(exc)
         reader_proc.stdout.close()   # closing pipe sends SIGPIPE to reader
         reader_proc.wait()
     try:
-        src_thread.join(timeout=60)
-        match = read_ok and img_hash[0] is not None and h.hexdigest() == img_hash[0]
+        src_thread.join()
+        if hash_error[0]:
+            state['verify_details'] = f'Could not hash source image: {hash_error[0]}'
+        elif not read_ok:
+            state['verify_details'] = state.get(
+                'verify_details', 'Could not read the selected disk.',
+            )
+        elif h.hexdigest() != img_hash[0]:
+            state['verify_details'] = 'Data read from the disk differs from the source image.'
+        else:
+            state['verify_details'] = ''
+        match = read_ok and not hash_error[0] and h.hexdigest() == img_hash[0]
         state['verify_result'] = 0 if match else 1
     finally:
         gauge.close()
@@ -884,6 +900,7 @@ def show_result(state):
         body  = (
             'The image was written but verification failed.\n'
             'The data on disk does not match the source image.\n\n'
+            f'{state.get("verify_details", "")}\n\n'
             f'Image:\n{img}\n\nTarget:\n{disk}'
         )
     else:
@@ -931,7 +948,8 @@ def main():
         'image_paths': [], 'image_labels': [], 'image_index': 0,
         'selected_image': '', 'selected_image_label': '',
         # results
-        'flash_result': 0, 'flash_details': '', 'verify_result': 0,
+        'flash_result': 0, 'flash_details': '',
+        'verify_result': 0, 'verify_details': '',
     }
 
     step = 1
