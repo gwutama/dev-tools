@@ -153,6 +153,18 @@ def remove_unpacked_image(state):
         Path(unpacked).unlink(missing_ok=True)
 
 
+def write_all(destination, chunk):
+    """Write a full chunk or raise OSError instead of silently truncating it."""
+    view = memoryview(chunk)
+    while view:
+        written = destination.write(view)
+        if written is None:
+            return
+        if written <= 0:
+            raise OSError('Device write made no progress.')
+        view = view[written:]
+
+
 def write_verification_log(image, device, image_size, bytes_read,
                            source_hash, device_hash, details):
     """Write persistent diagnostics for a failed verification."""
@@ -760,21 +772,29 @@ def flash_image(state):
             with open(image, 'rb') as src, open(out_dev, 'wb') as dst:
                 written = 0
                 for chunk in iter(lambda: src.read(CHUNK), b''):
-                    dst.write(chunk)
+                    write_all(dst, chunk)
                     written += len(chunk)
                     gauge.update(min(written * 100 // image_size, 99))
+                dst.flush()
+                os.fsync(dst.fileno())
         except OSError as e:
             write_ok = False
             err_details = str(e)
     else:
         # Non-root: open device via sudo python3 receiving data on stdin.
         writer_script = (
-            'import sys\n'
+            'import os,sys\n'
             'f=open(sys.argv[1],"wb")\n'
             'while True:\n'
             ' c=sys.stdin.buffer.read(4194304)\n'
             ' if not c:break\n'
-            ' f.write(c)\n'
+            ' v=memoryview(c)\n'
+            ' while v:\n'
+            '  n=f.write(v)\n'
+            '  if not n:raise OSError("Device write made no progress.")\n'
+            '  v=v[n:]\n'
+            'f.flush()\n'
+            'os.fsync(f.fileno())\n'
             'f.close()\n'
         )
         writer_proc = subprocess.Popen(
